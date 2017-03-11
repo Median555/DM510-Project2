@@ -19,6 +19,7 @@ static msg_t *top = NULL;
 asmlinkage
 int dm510_msgbox_put( char *buffer, int length )
 {
+	unsigned long flags;
 	// Length check
 	if (length < 0)
 	{
@@ -48,7 +49,8 @@ int dm510_msgbox_put( char *buffer, int length )
 	}
 	copy_from_user(msg->message, buffer, length);
 
-	// TODO: lock dat bitch, maybe...
+	// Lock critical region
+	local_irq_save(flags);
 	if (bottom == NULL)
 	{
 		bottom = msg;
@@ -60,6 +62,7 @@ int dm510_msgbox_put( char *buffer, int length )
 		msg->previous = top;
 		top = msg;
 	}
+	local_irq_restore(flags);
 
 	return 0;
 }
@@ -67,26 +70,29 @@ int dm510_msgbox_put( char *buffer, int length )
 asmlinkage
 int dm510_msgbox_get( char* buffer, int length )
 {
+	unsigned long flags;
 	if (top != NULL)
 	{
-		// TODO: lock dat bitch, maybe...
+		// Lock critical region
+		local_irq_save(flags);
 		if (top->length > length)
 		{
 			// Return error code for receiving buffer to small
-			// TODO: unlock before returning
+			// Unlock before returning
+			local_irq_restore(flags);
 			return -EMSGSIZE;
 		}
 
 		// Access check, write from buffer
 		if (!access_ok(VERIFY_WRITE, buffer, length))
 		{
+			local_irq_restore(flags);
 			return -EACCES;
-			// TODO: unlock before returning
 		}
 
 		msg_t* msg = top;
 		top = msg->previous;
-		// lock to here
+		local_irq_restore(flags);
 
 		int mlength = msg->length;
 
