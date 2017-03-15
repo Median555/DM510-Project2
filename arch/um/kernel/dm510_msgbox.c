@@ -71,10 +71,10 @@ asmlinkage
 int dm510_msgbox_get( char* buffer, int length )
 {
 	unsigned long flags;
+	// Lock critical region
+	local_irq_save(flags);
 	if (top != NULL)
 	{
-		// Lock critical region
-		local_irq_save(flags);
 		if (top->length > length)
 		{
 			// Return error code for receiving buffer to small
@@ -105,5 +105,6 @@ int dm510_msgbox_get( char* buffer, int length )
 
 		return mlength;
 	}
+	local_irq_restore(flags);
 	return -1;
 }
