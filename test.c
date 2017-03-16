@@ -5,18 +5,21 @@
 #include <sys/mman.h>
 #include <malloc.h>
 #include <unistd.h>
+#include <string.h>
 
+// Put a message in the message box
 int put(char* buffer, int length)
 {
 	return syscall(__NR_msg_put, buffer, length);
 }
 
+// Get a message from the message box
 int get(char* buffer, int length)
 {
 	return syscall(__NR_msg_get, buffer, length);
 }
 
-// removes all messages from stack
+// Removes all messages from stack
 void flush()
 {
 	int size = 1 << 10;
@@ -25,8 +28,41 @@ void flush()
 	while (get(buf, size) >= 0){;}
 }
 
+// TEST: proper message transfer
+void testFunctional()
+{
+	char *msg1 = "test1";
+    put(msg1, 6);
 
+    char *msg2 = "test2";
+    put(msg2, 6);
 
+    char *rec = (char *)malloc(6 * sizeof(char));
+
+	// Expect to get the second message because of stack structure
+    get(rec, 6);
+    if (strcmp(msg2, rec) != 0)
+	{
+		if (strcmp(msg1, rec) == 0)
+		{
+			printf("FAILED: \"Functionality test\", order incorrect");
+		}
+		else
+		{
+			printf("FAILED: \"Functionality test\", unexpected message received");
+		}
+		exit(EXIT_FAILURE);
+	}
+
+    get(rec, 6);
+	if (strcmp(msg1, rec) != 0)
+	{
+		printf("FAILED: \"Functionality test\", unexpected message received");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("DONE: \"Functionality test\"");
+}
 
 // TEST: Message length > 0
 void testMessageLength(char *msg)
@@ -101,12 +137,10 @@ void testBufferSize(char *msg, int msgLen)
 // TEST: receiving buffer write-able
 void testWriteAccess()
 {
-	//code inspired from https://linux.die.net/man/2/mprotect
-	//with some changes from http://www.tutorialspoint.com/unix_system_calls/mprotect.htm
-	int pagesize = sysconf(_SC_PAGESIZE); // Get the system page size
-	char *buffer = (char *)malloc(1024 + pagesize - 1); // Allocate 2nd-argument amount of bytes with alignment a multiple of 1st-argument
-	buffer = (char *)(((int) buffer + pagesize - 1) & ~(pagesize - 1));
-	mprotect(buffer, 1024, PROT_READ); // Only enable reading on the buffer allocated (Can only protect one whole page at a time)
+	// Code inspired from https://linux.die.net/man/2/mprotect
+	/*int pagesize = sysconf(_SC_PAGESIZE); // Get the system page size
+	char *buffer = memalign(pagesize, pagesize); // Allocate 2nd-argument amount of bytes with alignment a multiple of 1st-argument
+	mprotect(buffer, pagesize, PROT_READ); // Only enable reading on the buffer allocated (Can only protect one whole page at a time)
 	int ret = get(buffer, pagesize);
 	if (ret != -EACCES)
 	{
@@ -117,17 +151,16 @@ void testWriteAccess()
 	{
 		printf("DONE: \"Acces write check\"\n");
 		free(buffer);
-	}
+	}*/
 }
 
+// Aux function used in the concurrency test
 void childProcessPutChar(char c, int amount)
 {
-	// Put poison pill first, will be last to counter because of stack structure
-	char *b = (char *)malloc(1);
-	*b = '#';
-	put(b, 1);
-	free(b);
+	// Char buffer
+	char *b;
 
+	// Put amount of 'c' chars in message box
 	while (amount > 0)
 	{
 		b = (char *)malloc(1);
@@ -138,20 +171,30 @@ void childProcessPutChar(char c, int amount)
 		amount--;
 	}
 
+	// Put poison pill in the end to notify parent process
 	b = (char *)malloc(1);
 	*b = '#';
 	put(b, 1);
 	free(b);
 
+	// Kill the child
 	_exit(EXIT_SUCCESS);
 }
 
 // returns 0 for success
 // returns 1 if test result not valid
+/*
+	The test tries to provoke a race condition by simultaneously putting and
+	getting from the message box. Two child processes are created, one puts '+'
+	chars in the message box, the other '-' chars. They both put the same amount
+	of messages in the message box. Without waiting for the children to finish,
+	the parent process gets messages from the message box, incrementing a sum
+	when it gets a '+', decrementing on '-'. At the end, the sum should be zero.
+*/
 int runConcurrently(int amount)
 {
+	// Create the child process that will put '+' into the message box
 	pid_t pidUp = fork();
-
 	if (pidUp == -1)
 	{
 		printf("FAILED: \"Concurrency test\", forking of first child failed\n");
@@ -164,8 +207,8 @@ int runConcurrently(int amount)
 	}
 	else
 	{
+		// Create the child process that will put '-' into the message box
 		pid_t pidDown = fork();
-
 		if (pidDown == -1)
 		{
 			printf("FAILED: \"Concurrency test\", forking of second child failed\n");
@@ -181,17 +224,19 @@ int runConcurrently(int amount)
 			// Sum the stack
 			int poisonPillsReceived = 0;
 			long count = 0;
+			int ret = 0; // return value from get
 
-			while (poisonPillsReceived < 4)
+			while (poisonPillsReceived < 2 || ret != -1)
 			{
 				char *rec = (char *)malloc(2);
-				int temp = get(rec, 2);
-				if (temp < -1)
+				ret = get(rec, 2);
+				if (ret < -1)
 				{
-					printf("FAILED: \"Concurrency test\", error while getting from mailbox, return value %d\n", temp);
+					printf("FAILED: \"Concurrency test\", error while getting from mailbox, return value %d\n", ret);
 					exit(EXIT_FAILURE);
 				}
 
+				// Handle the message
 				switch (*rec)
 				{
 					case '+': count++; break;
@@ -199,15 +244,20 @@ int runConcurrently(int amount)
 					case '#': poisonPillsReceived++; break;
 				}
 
+				free(rec);
+
+				// If we received all of one char, we know that no concurrent
+				//  work occurred, therefore the test did not fufill its
+				//  purpose. The outer function should rerun the test then.
 				if (count == amount || count == -amount)
 				{
-					printf("FAILED: \"Failed premiss for concurrency test\"\n");
+					printf("WARNING: \"Failed premiss for concurrency test\"\n");
+
+					// Don't leave children running
 					waitpid(pidUp, NULL, 0);
 					waitpid(pidDown, NULL, 0);
 					return 1;
 				}
-
-				free(rec);
 			}
 
 			if (count != 0)
@@ -230,65 +280,22 @@ int main(int argc, char ** argv)
 	int msgLen = 7;
 	int ret;
 
+	// This test should be tested without other messages in the message box,
+	//  so to be sure, remove any.
 	flush();
 
-	//Bounds tests:
+	testFunctional();
+
+	// Bounds tests:
 	testMessageLength(msg);
 	testAllocationSize(msg);
 	testEmptyStack();
 	testBufferSize(msg, msgLen);
 	// testWriteAccess();  Does not currently work
 
-	// test concurrency
+	// Test concurrency
 	while (runConcurrently(10000))
 	{
 		flush();
 	}
-
-
-
-	// TEST: proper message transfer
-
-	// TODO: test if ==
-
-	// concurrency test
-
-
-    /*char *msg = "Hej!";
-    syscall(__NR_msg_put, msg, 5);
-
-    msg = "Kage!";
-    syscall(__NR_msg_put, msg, 6);
-
-    char *get = (char *)malloc(6 * sizeof(char));
-    syscall(__NR_msg_get, get, 6);
-    printf("Msg: %s\n", get);
-
-    free(get);
-    get = (char *)malloc(5 * sizeof(char));
-    syscall(__NR_msg_get, get, 5);
-    printf("Msg: %s\n", get);*/
 }
-
-
-
-
-
-
-/*
-
-Checks:
-
-Put:
-length < 0
-access ok for reading
-kmalloc success
-
-Get:
-any messages
-destination buffer to small for message
-access ok for destination buffer writing
-
-
-Test for concurrency
-*/
